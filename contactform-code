@@ -1,0 +1,119 @@
+library(readxl)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+library(RCurl)
+
+uri <- "https://redcap-surveys.moffitt123.org/api/"
+token <- "AHIM9846"  
+
+### Call the server
+rawCsvText <- RCurl::postForm(
+  uri = uri, 
+  token = token, 
+  content ='record',
+  format = 'csv', 
+  type = 'flat', 
+  .opts = curlOptions(ssl.verifypeer=FALSE)
+)
+
+fpc <- read.csv(text=rawCsvText,  stringsAsFactors=FALSE)
+fpc[fpc== ""] <- NA
+fpc[fpc== "NA"] <- NA
+
+
+
+##############################################
+############### Contact form ################
+############################################
+# Define form variables
+c.vars <- c("redcap_id", "redcap_event_name", names(select(fpc, address_1:county, ssn_yn:preferredmode___2, cell_number:comments_contactinfo, today, contact_information_complete)))
+
+# Subset to just consented individuals: 
+cons<- ed %>% filter(substr(ed$DATSTAT_ALTPID, 1, 3)== "ED-" & ed$ELIGIBLE %in% c("Eligible") & (!is.na(ed$CONSENT_DATE) & ed$CONSENT_DATE != ""))
+
+# Check which variables I am missing in the redcap 
+setdiff(c.vars, tolower(names(cons)))
+
+ed.c<- read.csv(file="Anna/Data/Redcap.csv")
+ed.c<- ed.c %>% filter(DATSTAT_ALTPID %in% cons$DATSTAT_ALTPID) %>% select(DATSTAT_ALTPID, ADDRESS1:COUNTY, SSN:PREFERREDCONTACT, PREFERREDMODE,
+                                                                           CELL_NUMBER:TODAY) %>% unique()
+
+
+# Manually add the ones with different names
+cons.c <- ed.c %>% 
+  select(DATSTAT_ALTPID, ADDRESS1, ADDRESS2, ZIP, SSN, SSN.TEXT, PREFERREDCONTACT, PREFERREDMODE, COMMENTS_CONTACTINFO,
+         toupper(intersect(tolower(names(cons)), c.vars))) %>% unique()
+
+# Make datstat variables lower case
+names(cons.c)<- tolower(names(cons.c))
+
+# Check duplicates
+dup <- cons.c %>%
+  group_by(datstat_altpid) %>%
+  filter(n()>1)
+
+duplicates <- cons.c %>%
+  pull(datstat_altpid) %>%
+  duplicated() %>%
+  which() %>%
+  cons.c$datstat_altpid[.]
+
+# Choose which one of duplicates to keep and delete others by row to ensure accuracy
+cons.c <- cons.c[-c(1, 2, 326, 532, 82, 371, 570, 631, 202, 478, 675),]
+
+# Clean data to match redcap
+# Rename
+cons.c1 <- cons.c %>% 
+  rename(address_1 = address1,
+         address_2 = address2,
+         postal_code = zip,
+         ssn_yn = ssn,
+         ssn = ssn.text,
+         redcap_id = datstat_altpid)
+
+
+# Checkboxes
+cons.c1 <- cons.c1 %>% 
+  mutate(preferredcontact___1 = ifelse(preferredcontact == 'EMAIL' | preferredcontact == 'EMAIL,PHONE' | preferredcontact == 'EMAIL,PHONE,TEXT' |
+                                         preferredcontact == 'EMAIL,TEXT', 1, 0))
+cons.c1 <- cons.c1 %>% 
+  mutate(preferredcontact___2 = ifelse(preferredcontact == 'EMAIL,PHONE' | preferredcontact == 'EMAIL,PHONE,TEXT'| preferredcontact == 'PHONE' |
+                                         preferredcontact == 'PHONE,TEXT', 1, 0))          
+cons.c1 <- cons.c1 %>% 
+  mutate(preferredcontact___3 = ifelse(preferredcontact == 'TEXT' | preferredcontact == 'EMAIL,PHONE,TEXT'| preferredcontact == 'EMAIL,TEXT' |
+                                         preferredcontact == 'PHONE,TEXT', 1, 0))
+
+# 1 = online link & 2 = paper version
+cons.c1 <- cons.c1 %>% 
+  mutate(preferredmode___1 = ifelse(preferredmode == 1, 1, 0),
+         preferredmode___2 = ifelse(preferredmode == 2, 1, 0))
+
+cons.c1 <- cons.c1 %>% 
+  select(-c(preferredcontact, preferredmode))
+
+# Create variables in redcap that not in datstat and rename existing variables (make sure to check both codebooks and datstat dictionaries)
+cons.c1 <- cons.c1 %>% dplyr::mutate(redcap_event_name = "on_study_20105_arm_3",
+                                    contact_information_complete=2, 
+                                    today= as.Date(today, format="%m/%d/%Y"))
+
+# Create a map of IDs to link: 
+ids_map<- fpc %>% filter(redcap_event_name== "screening_arm_1") %>% 
+  select(redcap_id, mrn_scrn, screening_id) %>% 
+  mutate(order= as.numeric(gsub("FPC_", "", screening_id))) %>% 
+  arrange(order) 
+arm2<- fpc %>% filter(redcap_event_name== "on_study_20105_arm_3") %>% select(redcap_id, sequence_num)
+ids_map<- merge(ids_map, arm2, by= "redcap_id", all.y  = T)
+
+# Join ids to data
+cons.c2 <- cons.c1 %>% 
+  rename(sequence_num = redcap_id)
+c <- left_join(cons.c2, ids_map, by = 'sequence_num') %>% 
+  unique()
+c <- c %>% 
+  select(-c(mrn_scrn, screening_id, order, sequence_num))
+
+#write_csv(c, 'Data/RedCap/ContactForm_with_IDs.csv')
+
+# Import
+result_write <- REDCapR::redcap_write(c, redcap_uri=  uri, token=token)
